@@ -284,8 +284,8 @@ def style_table(df: pd.DataFrame):
             return "color: red; font-weight: bold"
         return ""
 
-    styler = df.style.applymap(color_chg, subset=["Chg%"])
-    styler = styler.applymap(color_div, subset=["Div 15m", "Div 1D"])
+    styler = df.style.map(color_chg, subset=["Chg%"])
+    styler = styler.map(color_div, subset=["Div 15m", "Div 1D"])
     return styler
 
 
