@@ -1,0 +1,9 @@
+### One symbol per line, or comma-separated. Bare tickers get .NS (NSE) appended.
+### Lines starting with ### are comments.
+RELIANCE
+TCS
+INFY
+HDFCBANK
+ICICIBANK
+SBIN
+QPOWER
