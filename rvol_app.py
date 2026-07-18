@@ -24,8 +24,10 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 
 # ============================================================================
@@ -73,36 +75,61 @@ def local_pivots(values: np.ndarray, order: int = 3):
     return _dedupe_adjacent(minima), _dedupe_adjacent(maxima)
 
 
-def detect_divergence(close: pd.Series, rsi: pd.Series, lookback: int = 50, order: int = 3):
+def detect_divergence(close: pd.Series, rsi: pd.Series, lookback: int = 50, order: int = 3) -> dict:
     """Compares the two most recent price swing lows (bullish) / swing highs
     (bearish) against RSI at those same bars -- the standard divergence
-    definition. Returns (bullish: bool, bearish: bool)."""
+    definition.
+
+    Returns a dict, not just booleans, so the caller can show/chart exactly
+    where the divergence was found:
+        {
+          "bullish": bool, "bearish": bool,
+          "bullish_detail": {"prev": {"time", "price", "rsi"}, "curr": {...}} or None,
+          "bearish_detail": {...} or None,
+        }
+    "prev"/"curr" are the two pivot bars compared, oldest first.
+    """
+    empty = {"bullish": False, "bearish": False, "bullish_detail": None, "bearish_detail": None}
     n = len(close)
     lb = min(lookback, n)
     if lb < order * 2 + 2:
-        return False, False
+        return empty
 
-    c = close.iloc[-lb:].reset_index(drop=True)
-    r = rsi.iloc[-lb:].reset_index(drop=True)
+    # NOTE: deliberately NOT using reset_index() here (unlike an earlier
+    # version) -- .iloc still gives positional access on a Series with its
+    # original index intact, and keeping the DatetimeIndex is exactly what
+    # lets us report *when* each pivot happened, not just its bar position.
+    c = close.iloc[-lb:]
+    r = rsi.iloc[-lb:]
     first_valid = r.first_valid_index()
     if first_valid is None:
-        return False, False
-    c = c.iloc[first_valid:].reset_index(drop=True)
-    r = r.iloc[first_valid:].reset_index(drop=True)
+        return empty
+    c = c.loc[first_valid:]
+    r = r.loc[first_valid:]
+    if len(c) < order * 2 + 2:
+        return empty
 
     minima, maxima = local_pivots(c.values, order=order)
 
-    bullish = False
+    def _point(pos: int) -> dict:
+        return {"time": c.index[pos], "price": float(c.iloc[pos]), "rsi": float(r.iloc[pos])}
+
+    bullish, bullish_detail = False, None
     if len(minima) >= 2:
         i_prev, i_curr = minima[-2], minima[-1]
         bullish = bool((c.iloc[i_curr] < c.iloc[i_prev]) and (r.iloc[i_curr] > r.iloc[i_prev]))
+        if bullish:
+            bullish_detail = {"prev": _point(i_prev), "curr": _point(i_curr)}
 
-    bearish = False
+    bearish, bearish_detail = False, None
     if len(maxima) >= 2:
         j_prev, j_curr = maxima[-2], maxima[-1]
         bearish = bool((c.iloc[j_curr] > c.iloc[j_prev]) and (r.iloc[j_curr] < r.iloc[j_prev]))
+        if bearish:
+            bearish_detail = {"prev": _point(j_prev), "curr": _point(j_curr)}
 
-    return bullish, bearish
+    return {"bullish": bullish, "bearish": bearish,
+            "bullish_detail": bullish_detail, "bearish_detail": bearish_detail}
 
 
 def compute_rvol_chg_ss(daily: pd.DataFrame, lookback: int = 20, intraday: pd.DataFrame = None) -> Optional[dict]:
@@ -200,8 +227,10 @@ class ScanRow:
     strong_start: bool
     rsi_15m: Optional[float]
     div_15m: Optional[str]   # "Bullish" | "Bearish" | None
+    div_15m_detail: Optional[dict]
     rsi_1d: Optional[float]
     div_1d: Optional[str]
+    div_1d_detail: Optional[dict]
     note: Optional[str] = None
 
 
@@ -215,13 +244,13 @@ def scan(tickers: list, rvol_lookback: int, div_lookback: int, pivot_order: int)
         intraday = intraday_data.get(t)
 
         if daily is None or len(daily) < rvol_lookback + 2:
-            rows.append(ScanRow(t, None, None, None, False, None, None, None, None,
+            rows.append(ScanRow(t, None, None, None, False, None, None, None, None, None, None,
                                  note="No/insufficient daily data from Yahoo Finance for this ticker."))
             continue
 
         base = compute_rvol_chg_ss(daily, lookback=rvol_lookback, intraday=intraday)
         if base is None:
-            rows.append(ScanRow(t, None, None, None, False, None, None, None, None,
+            rows.append(ScanRow(t, None, None, None, False, None, None, None, None, None, None,
                                  note="Could not compute RVOL (insufficient history)."))
             continue
 
@@ -236,21 +265,23 @@ def scan(tickers: list, rvol_lookback: int, div_lookback: int, pivot_order: int)
         daily_close_valid = not pd.isna(daily["Close"].iloc[-1])
         rsi_1d_series = compute_rsi(daily["Close"])
         rsi_1d = float(rsi_1d_series.iloc[-1]) if (daily_close_valid and not pd.isna(rsi_1d_series.iloc[-1])) else None
-        bull_1d, bear_1d = detect_divergence(daily["Close"], rsi_1d_series, lookback=div_lookback, order=pivot_order)
-        div_1d = "Bullish" if bull_1d else ("Bearish" if bear_1d else None)
+        div_result_1d = detect_divergence(daily["Close"], rsi_1d_series, lookback=div_lookback, order=pivot_order)
+        div_1d = "Bullish" if div_result_1d["bullish"] else ("Bearish" if div_result_1d["bearish"] else None)
+        div_1d_detail = div_result_1d["bullish_detail"] if div_result_1d["bullish"] else div_result_1d["bearish_detail"]
 
-        rsi_15m, div_15m = None, None
+        rsi_15m, div_15m, div_15m_detail = None, None, None
         if intraday is not None and len(intraday) >= pivot_order * 2 + 2:
             intraday_close_valid = not pd.isna(intraday["Close"].iloc[-1])
             rsi_15m_series = compute_rsi(intraday["Close"])
             rsi_15m = float(rsi_15m_series.iloc[-1]) if (intraday_close_valid and not pd.isna(rsi_15m_series.iloc[-1])) else None
-            bull_15m, bear_15m = detect_divergence(intraday["Close"], rsi_15m_series, lookback=div_lookback, order=pivot_order)
-            div_15m = "Bullish" if bull_15m else ("Bearish" if bear_15m else None)
+            div_result_15m = detect_divergence(intraday["Close"], rsi_15m_series, lookback=div_lookback, order=pivot_order)
+            div_15m = "Bullish" if div_result_15m["bullish"] else ("Bearish" if div_result_15m["bearish"] else None)
+            div_15m_detail = div_result_15m["bullish_detail"] if div_result_15m["bullish"] else div_result_15m["bearish_detail"]
 
         rows.append(ScanRow(
             symbol=t, cmp=base["cmp"], rvol=base["rvol"], chg_pct=base["chg_pct"],
-            strong_start=base["strong_start"], rsi_15m=rsi_15m, div_15m=div_15m,
-            rsi_1d=rsi_1d, div_1d=div_1d, note=row_note,
+            strong_start=base["strong_start"], rsi_15m=rsi_15m, div_15m=div_15m, div_15m_detail=div_15m_detail,
+            rsi_1d=rsi_1d, div_1d=div_1d, div_1d_detail=div_1d_detail, note=row_note,
         ))
     return rows
 
@@ -328,6 +359,93 @@ def style_table(df: pd.DataFrame):
     return styler
 
 
+def get_price_rsi_series(ticker: str, timeframe: str, all_tickers: tuple):
+    """Re-derives the raw Close/RSI series for one ticker so the detail view
+    can chart them. Deliberately calls fetch_batch with the SAME tickers
+    tuple used by the main scan (not just [ticker]) so this hits the
+    existing st.cache_data entry instead of triggering a fresh yfinance call."""
+    if timeframe == "1d":
+        data = fetch_batch(all_tickers, period="1y", interval="1d")
+    else:
+        data = fetch_batch(all_tickers, period="60d", interval="15m")
+    df = data.get(ticker)
+    if df is None:
+        return None, None
+    close = df["Close"]
+    rsi = compute_rsi(close)
+    return close, rsi
+
+
+def build_divergence_chart(close: pd.Series, rsi: pd.Series, detail: dict, kind: str, context_bars: int = 60):
+    """Two-panel price+RSI chart with the divergence's two pivot points
+    marked and connected on both panes -- the visual crosscheck. Shows some
+    context before/after the pivots, not just the two points in isolation."""
+    end_time = detail["curr"]["time"]
+    end_pos = close.index.get_indexer([end_time], method="nearest")[0]
+    start_pos = max(0, end_pos - context_bars)
+    stop_pos = min(len(close), end_pos + max(5, context_bars // 6))
+
+    price_window = close.iloc[start_pos:stop_pos]
+    rsi_window = rsi.iloc[start_pos:stop_pos]
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4],
+                         vertical_spacing=0.06, subplot_titles=("Price", "RSI"))
+
+    fig.add_trace(go.Scatter(x=price_window.index, y=price_window.values, mode="lines",
+                              name="Price", line=dict(color="#1f77b4", width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=rsi_window.index, y=rsi_window.values, mode="lines",
+                              name="RSI", line=dict(color="#9467bd", width=1.5)), row=2, col=1)
+
+    color = "#0b8043" if kind == "Bullish" else "#cc2222"
+    prev, curr = detail["prev"], detail["curr"]
+    fig.add_trace(go.Scatter(x=[prev["time"], curr["time"]], y=[prev["price"], curr["price"]],
+                              mode="markers+lines", marker=dict(size=11, color=color, symbol="diamond"),
+                              line=dict(color=color, dash="dash", width=2), name=f"{kind} (price)"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=[prev["time"], curr["time"]], y=[prev["rsi"], curr["rsi"]],
+                              mode="markers+lines", marker=dict(size=11, color=color, symbol="diamond"),
+                              line=dict(color=color, dash="dash", width=2), name=f"{kind} (RSI)"), row=2, col=1)
+
+    fig.add_hline(y=70, line_dash="dot", line_color="gray", row=2, col=1)
+    fig.add_hline(y=30, line_dash="dot", line_color="gray", row=2, col=1)
+
+    fig.update_layout(height=480, showlegend=False, margin=dict(t=40, b=10, l=10, r=10))
+    return fig
+
+
+def render_divergence_detail(row: "ScanRow", all_tickers: tuple):
+    """The click-through detail panel: exact From/To bars (time, price, RSI)
+    plus a chart, for each timeframe that has a flagged divergence."""
+    st.subheader(f"Divergence detail \u2014 {row.symbol.replace('.NS', '')}")
+
+    panels = [("15m", row.div_15m, row.div_15m_detail), ("1D", row.div_1d, row.div_1d_detail)]
+    panels = [(tf, kind, detail) for tf, kind, detail in panels if kind and detail]
+
+    if not panels:
+        st.info("No divergence flagged for this symbol on either timeframe.")
+        return
+
+    for tf, kind, detail in panels:
+        arrow = "\u25b2" if kind == "Bullish" else "\u25bc"
+        st.markdown(f"**{tf} \u2014 {arrow} {kind} divergence**")
+        prev, curr = detail["prev"], detail["curr"]
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("*From (earlier swing)*")
+            st.write(f"Time: {prev['time']}")
+            st.write(f"Price: {prev['price']:.2f}")
+            st.write(f"RSI: {prev['rsi']:.1f}")
+        with c2:
+            st.markdown("*To (latest swing)*")
+            st.write(f"Time: {curr['time']}")
+            st.write(f"Price: {curr['price']:.2f}")
+            st.write(f"RSI: {curr['rsi']:.1f}")
+
+        close, rsi = get_price_rsi_series(row.symbol, "1d" if tf == "1D" else "15m", all_tickers)
+        if close is not None:
+            st.plotly_chart(build_divergence_chart(close, rsi, detail, kind), use_container_width=True)
+        st.divider()
+
+
 # ============================================================================
 # main
 # ============================================================================
@@ -388,7 +506,18 @@ def main():
     ordered = sorted(valid, key=key_fn, reverse=True) + invalid
 
     df = rows_to_dataframe(ordered, trend, rvol_as)
-    st.dataframe(style_table(df), use_container_width=True, hide_index=True)
+    event = st.dataframe(
+        style_table(df), use_container_width=True, hide_index=True,
+        on_select="rerun", selection_mode="single-row",
+    )
+
+    selected_positions = event.selection.rows if event and event.selection else []
+    if selected_positions:
+        selected_row = ordered[selected_positions[0]]
+        st.divider()
+        render_divergence_detail(selected_row, tuple(tickers))
+    else:
+        st.caption("Click a row above to see exactly where a flagged divergence was found (From/To bars + chart).")
 
     notes = [r for r in rows if r.note]
     if notes:
