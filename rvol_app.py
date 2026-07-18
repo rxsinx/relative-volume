@@ -105,24 +105,53 @@ def detect_divergence(close: pd.Series, rsi: pd.Series, lookback: int = 50, orde
     return bullish, bearish
 
 
-def compute_rvol_chg_ss(daily: pd.DataFrame, lookback: int = 20) -> Optional[dict]:
+def compute_rvol_chg_ss(daily: pd.DataFrame, lookback: int = 20, intraday: pd.DataFrame = None) -> Optional[dict]:
     """`daily`: OHLCV sorted ascending; the last row is treated as "today" --
     if the market's live this is Yahoo's developing bar for today, if closed
     it's simply the last completed session. No special-casing needed either
-    way, unlike a live broker feed."""
+    way, unlike a live broker feed.
+
+    Yahoo's "today" daily bar can occasionally have a NaN Close mid-session
+    (especially on a fast/volatile move) while Open/Low/Volume are already
+    populated -- if so, fall back to the most recent valid 15m close, which
+    Yahoo's intraday feed tends to populate more reliably than the daily
+    aggregate bar."""
     if daily is None or len(daily) < lookback + 2:
         return None
     today = daily.iloc[-1]
     prev = daily.iloc[-2]
     avg_vol = daily["Volume"].iloc[-(lookback + 1):-1].mean()
     volume = today["Volume"]
-    rvol = (volume / avg_vol) if avg_vol else None
+
     cmp_ = today["Close"]
+    if pd.isna(cmp_) and intraday is not None and len(intraday) > 0:
+        valid_intraday_close = intraday["Close"].dropna()
+        if len(valid_intraday_close) > 0:
+            cmp_ = valid_intraday_close.iloc[-1]
+
     prev_close = prev["Close"]
-    chg_pct = ((cmp_ - prev_close) / prev_close * 100) if prev_close else None
-    strong_start = bool(today["Open"] > prev_close and today["Low"] >= prev_close * 0.995)
-    return {"cmp": float(cmp_), "rvol": rvol, "chg_pct": chg_pct,
-            "strong_start": strong_start, "volume": float(volume), "avg_volume": avg_vol}
+    volume_ok = not pd.isna(volume) and volume > 0
+    rvol = (volume / avg_vol) if (avg_vol and volume_ok) else None
+
+    cmp_ok = not pd.isna(cmp_)
+    prev_close_ok = not pd.isna(prev_close) and prev_close != 0
+    chg_pct = ((cmp_ - prev_close) / prev_close * 100) if (cmp_ok and prev_close_ok) else None
+
+    today_open, today_low = today["Open"], today["Low"]
+    strong_start = bool(
+        not pd.isna(today_open) and not pd.isna(today_low) and prev_close_ok
+        and today_open > prev_close and today_low >= prev_close * 0.995
+    )
+
+    return {
+        "cmp": float(cmp_) if cmp_ok else None,
+        "rvol": rvol,
+        "chg_pct": chg_pct,
+        "strong_start": strong_start,
+        "volume": float(volume) if not pd.isna(volume) else None,
+        "avg_volume": avg_vol,
+        "cmp_from_fallback": cmp_ok and pd.isna(today["Close"]),
+    }
 
 
 # ============================================================================
@@ -190,28 +219,38 @@ def scan(tickers: list, rvol_lookback: int, div_lookback: int, pivot_order: int)
                                  note="No/insufficient daily data from Yahoo Finance for this ticker."))
             continue
 
-        base = compute_rvol_chg_ss(daily, lookback=rvol_lookback)
+        base = compute_rvol_chg_ss(daily, lookback=rvol_lookback, intraday=intraday)
         if base is None:
             rows.append(ScanRow(t, None, None, None, False, None, None, None, None,
                                  note="Could not compute RVOL (insufficient history)."))
             continue
 
+        row_note = None
+        if base.get("cmp_from_fallback"):
+            row_note = "Today's daily Close was missing from Yahoo's feed -- CMP/Chg% use the latest 15m close instead."
+
+        # pandas' ewm().mean() carries the PREVIOUS value forward when the
+        # trailing input is NaN rather than emitting NaN -- so if today's
+        # Close is missing, a naive rsi.iloc[-1] silently returns yesterday's
+        # RSI looking like a fresh number. Guard explicitly instead of trusting it.
+        daily_close_valid = not pd.isna(daily["Close"].iloc[-1])
         rsi_1d_series = compute_rsi(daily["Close"])
-        rsi_1d = float(rsi_1d_series.iloc[-1]) if not pd.isna(rsi_1d_series.iloc[-1]) else None
+        rsi_1d = float(rsi_1d_series.iloc[-1]) if (daily_close_valid and not pd.isna(rsi_1d_series.iloc[-1])) else None
         bull_1d, bear_1d = detect_divergence(daily["Close"], rsi_1d_series, lookback=div_lookback, order=pivot_order)
         div_1d = "Bullish" if bull_1d else ("Bearish" if bear_1d else None)
 
         rsi_15m, div_15m = None, None
         if intraday is not None and len(intraday) >= pivot_order * 2 + 2:
+            intraday_close_valid = not pd.isna(intraday["Close"].iloc[-1])
             rsi_15m_series = compute_rsi(intraday["Close"])
-            rsi_15m = float(rsi_15m_series.iloc[-1]) if not pd.isna(rsi_15m_series.iloc[-1]) else None
+            rsi_15m = float(rsi_15m_series.iloc[-1]) if (intraday_close_valid and not pd.isna(rsi_15m_series.iloc[-1])) else None
             bull_15m, bear_15m = detect_divergence(intraday["Close"], rsi_15m_series, lookback=div_lookback, order=pivot_order)
             div_15m = "Bullish" if bull_15m else ("Bearish" if bear_15m else None)
 
         rows.append(ScanRow(
             symbol=t, cmp=base["cmp"], rvol=base["rvol"], chg_pct=base["chg_pct"],
             strong_start=base["strong_start"], rsi_15m=rsi_15m, div_15m=div_15m,
-            rsi_1d=rsi_1d, div_1d=div_1d,
+            rsi_1d=rsi_1d, div_1d=div_1d, note=row_note,
         ))
     return rows
 
