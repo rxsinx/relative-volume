@@ -1,17 +1,28 @@
 """
-RVOL + RSI Divergence Scanner
-=============================
-Streamlit app -- RVOL/Chg%/Strong-Start from the original strategy, plus RSI
-divergence on 15-minute and 1-day timeframes, over a NSE equity watchlist.
-Data source: yfinance (Yahoo Finance) -- no broker API/login required.
+RVOL + Divergence Scanner
+=========================
+Streamlit app -- RVOL/Chg%/Strong-Start from the original strategy, plus
+multi-indicator divergence (RSI, OBV, MFI) on 15-minute and 1-day
+timeframes, over a NSE equity watchlist. Data source: yfinance (Yahoo
+Finance) -- no broker API/login required.
 
     RVOL = today's volume / SMA(prior N days' volume)   [today excluded]
     Chg% = (CMP - prev_close) / prev_close * 100
     SS   = today_open > prev_close AND today_low >= prev_close * 0.995
 
-    RSI divergence (per timeframe, over the last 50/100 candles):
-      Bullish = price makes a LOWER swing low while RSI makes a HIGHER low
-      Bearish = price makes a HIGHER swing high while RSI makes a LOWER high
+DIVERGENCE, generalized across RSI / OBV / MFI:
+    Regular bullish = price makes a flat-or-lower swing low, indicator rises  (reversal-up signal)
+    Hidden  bullish = price makes a clear HIGHER swing low, indicator falls  (uptrend-continuation signal)
+    Regular bearish = price makes a flat-or-higher swing high, indicator falls (reversal-down signal)
+    Hidden  bearish = price makes a clear LOWER swing high, indicator rises  (downtrend-continuation signal)
+
+CLASS GRADING (A strongest, C weakest) -- both price and indicator moves
+are measured as a fraction of their own recent range within the lookback
+window, so the same A/B/C rule works for RSI/MFI (0-100) and OBV
+(unbounded, stock-specific scale) alike:
+    Class B = price pivot-to-pivot move is ~flat (a double top/bottom) -- the classic "double divergence"
+    Class C = price makes a clear new extreme, but the indicator's counter-move is weak
+    Class A = both price's new extreme AND the indicator's counter-move are clear/strong
 
 NOTE ON DATA: Yahoo Finance data is free but delayed (typically 15-20+ min
 for NSE) and rate-limited -- this is not a substitute for a broker feed for
@@ -30,8 +41,21 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 
+INDICATOR_LABEL = {"rsi": "RSI", "obv": "OBV", "mfi": "MFI"}
+CLASS_RANK = {"A": 3, "B": 2, "C": 1}
+SIGNAL_TYPES = ("regular_bullish", "hidden_bullish", "regular_bearish", "hidden_bearish")
+
+
+def _empty_signals() -> dict:
+    return {sig: None for sig in SIGNAL_TYPES}
+
+
+def _empty_div() -> dict:
+    return {"rsi": _empty_signals(), "obv": _empty_signals(), "mfi": _empty_signals()}
+
+
 # ============================================================================
-# indicators -- RSI, pivot-based divergence, RVOL/Chg%/SS
+# indicators -- RSI, OBV, MFI
 # ============================================================================
 
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -46,6 +70,30 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     rsi = rsi.where(~((avg_gain == 0) & (avg_loss == 0)), 50.0)
     return rsi
 
+
+def compute_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    direction = np.sign(close.diff().fillna(0))
+    return (direction * volume.fillna(0)).cumsum()
+
+
+def compute_mfi(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, period: int = 14) -> pd.Series:
+    typical_price = (high + low + close) / 3
+    raw_money_flow = typical_price * volume
+    tp_diff = typical_price.diff()
+    positive_flow = raw_money_flow.where(tp_diff > 0, 0.0)
+    negative_flow = raw_money_flow.where(tp_diff < 0, 0.0)
+    positive_sum = positive_flow.rolling(period, min_periods=period).sum()
+    negative_sum = negative_flow.rolling(period, min_periods=period).sum()
+    mfr = positive_sum / negative_sum
+    mfi = 100 - (100 / (1 + mfr))
+    mfi = mfi.where(negative_sum != 0, 100.0)
+    mfi = mfi.where(~((positive_sum == 0) & (negative_sum == 0)), 50.0)
+    return mfi
+
+
+# ============================================================================
+# pivots + generalized divergence detection (regular/hidden, class A/B/C)
+# ============================================================================
 
 def _dedupe_adjacent(idx_list):
     """Collapses runs of adjacent pivot indices (flat plateaus) to their midpoint."""
@@ -75,62 +123,128 @@ def local_pivots(values: np.ndarray, order: int = 3):
     return _dedupe_adjacent(minima), _dedupe_adjacent(maxima)
 
 
-def detect_divergence(close: pd.Series, rsi: pd.Series, lookback: int = 50, order: int = 3) -> dict:
-    """Compares the two most recent price swing lows (bullish) / swing highs
-    (bearish) against RSI at those same bars -- the standard divergence
-    definition.
+def _classify_pivot_pair(price_delta, ind_delta, price_range, ind_range,
+                          flat_thresh: float, weak_thresh: float, family: str):
+    """`family`: 'bullish' (minima pivots) or 'bearish' (maxima pivots).
+    Returns (signal_type, class_grade) -- signal_type in {'regular','hidden',None}.
 
-    Returns a dict, not just booleans, so the caller can show/chart exactly
-    where the divergence was found:
-        {
-          "bullish": bool, "bearish": bool,
-          "bullish_detail": {"prev": {"time", "price", "rsi"}, "curr": {...}} or None,
-          "bearish_detail": {...} or None,
-        }
-    "prev"/"curr" are the two pivot bars compared, oldest first.
+    Both deltas are expressed as a fraction of their own recent range before
+    any thresholding, which is what lets the same A/B/C rule apply to RSI,
+    MFI (0-100 bounded) and OBV (unbounded) uniformly."""
+    price_frac = (price_delta / price_range) if price_range > 0 else 0.0
+    ind_frac = (ind_delta / ind_range) if ind_range > 0 else 0.0
+
+    price_state = "higher" if price_frac > flat_thresh else ("lower" if price_frac < -flat_thresh else "flat")
+    ind_dir = "up" if ind_frac > 0 else ("down" if ind_frac < 0 else "flat")
+    ind_strong = abs(ind_frac) > weak_thresh
+
+    if ind_dir == "flat":
+        return None, None
+
+    if family == "bullish":
+        if price_state in ("flat", "lower") and ind_dir == "up":
+            return "regular", ("B" if price_state == "flat" else ("A" if ind_strong else "C"))
+        if price_state == "higher" and ind_dir == "down":
+            return "hidden", ("A" if ind_strong else "C")
+    else:
+        if price_state in ("flat", "higher") and ind_dir == "down":
+            return "regular", ("B" if price_state == "flat" else ("A" if ind_strong else "C"))
+        if price_state == "lower" and ind_dir == "up":
+            return "hidden", ("A" if ind_strong else "C")
+
+    return None, None
+
+
+def analyze_pivots(close: pd.Series, indicator: pd.Series, lookback: int = 50, order: int = 3,
+                    flat_thresh: float = 0.15, weak_thresh: float = 0.15) -> dict:
+    """Generalized divergence detector -- works for RSI, OBV, or MFI as the
+    `indicator` series (any series aligned to the same index as `close`).
+
+    Compares the two most recent price swing lows (bullish family) and
+    swing highs (bearish family) against the indicator at those same bars,
+    and classifies each pair as regular or hidden divergence (or neither),
+    graded A/B/C.
+
+    Returns a dict with keys "regular_bullish", "hidden_bullish",
+    "regular_bearish", "hidden_bearish" -- each either None or
+    {"class": "A"/"B"/"C", "prev": {...}, "curr": {...}}, where prev/curr
+    hold {"time", "price", "indicator"}.
     """
-    empty = {"bullish": False, "bearish": False, "bullish_detail": None, "bearish_detail": None}
+    result = _empty_signals()
     n = len(close)
     lb = min(lookback, n)
     if lb < order * 2 + 2:
-        return empty
+        return result
 
-    # NOTE: deliberately NOT using reset_index() here (unlike an earlier
-    # version) -- .iloc still gives positional access on a Series with its
-    # original index intact, and keeping the DatetimeIndex is exactly what
-    # lets us report *when* each pivot happened, not just its bar position.
     c = close.iloc[-lb:]
-    r = rsi.iloc[-lb:]
-    first_valid = r.first_valid_index()
+    ind = indicator.iloc[-lb:]
+    first_valid = ind.first_valid_index()
     if first_valid is None:
-        return empty
+        return result
     c = c.loc[first_valid:]
-    r = r.loc[first_valid:]
+    ind = ind.loc[first_valid:]
     if len(c) < order * 2 + 2:
-        return empty
+        return result
 
+    price_range = c.max() - c.min()
+    ind_range = ind.max() - ind.min()
     minima, maxima = local_pivots(c.values, order=order)
 
     def _point(pos: int) -> dict:
-        return {"time": c.index[pos], "price": float(c.iloc[pos]), "rsi": float(r.iloc[pos])}
+        return {"time": c.index[pos], "price": float(c.iloc[pos]), "indicator": float(ind.iloc[pos])}
 
-    bullish, bullish_detail = False, None
     if len(minima) >= 2:
         i_prev, i_curr = minima[-2], minima[-1]
-        bullish = bool((c.iloc[i_curr] < c.iloc[i_prev]) and (r.iloc[i_curr] > r.iloc[i_prev]))
-        if bullish:
-            bullish_detail = {"prev": _point(i_prev), "curr": _point(i_curr)}
+        price_delta = c.iloc[i_curr] - c.iloc[i_prev]
+        ind_delta = ind.iloc[i_curr] - ind.iloc[i_prev]
+        sig, grade = _classify_pivot_pair(price_delta, ind_delta, price_range, ind_range, flat_thresh, weak_thresh, "bullish")
+        if sig:
+            result[f"{sig}_bullish"] = {"class": grade, "prev": _point(i_prev), "curr": _point(i_curr)}
 
-    bearish, bearish_detail = False, None
     if len(maxima) >= 2:
         j_prev, j_curr = maxima[-2], maxima[-1]
-        bearish = bool((c.iloc[j_curr] > c.iloc[j_prev]) and (r.iloc[j_curr] < r.iloc[j_prev]))
-        if bearish:
-            bearish_detail = {"prev": _point(j_prev), "curr": _point(j_curr)}
+        price_delta = c.iloc[j_curr] - c.iloc[j_prev]
+        ind_delta = ind.iloc[j_curr] - ind.iloc[j_prev]
+        sig, grade = _classify_pivot_pair(price_delta, ind_delta, price_range, ind_range, flat_thresh, weak_thresh, "bearish")
+        if sig:
+            result[f"{sig}_bearish"] = {"class": grade, "prev": _point(j_prev), "curr": _point(j_curr)}
 
-    return {"bullish": bullish, "bearish": bearish,
-            "bullish_detail": bullish_detail, "bearish_detail": bearish_detail}
+    return result
 
+
+def summarize_divergence(div_by_indicator: dict) -> Optional[dict]:
+    """Picks the single strongest signal across RSI/OBV/MFI x regular/hidden
+    x bullish/bearish for compact main-table display, and lists which
+    indicators agree on that exact same signal type (confluence)."""
+    best = None
+    for ind_name, signals in div_by_indicator.items():
+        for sig_type in SIGNAL_TYPES:
+            info = signals.get(sig_type)
+            if info is None:
+                continue
+            is_regular = sig_type.startswith("regular")
+            rank = (CLASS_RANK[info["class"]], 1 if is_regular else 0)
+            if best is None or rank > best["rank"]:
+                best = {"rank": rank, "indicator": ind_name, "sig_type": sig_type,
+                        "is_regular": is_regular, "class": info["class"], "detail": info}
+
+    if best is None:
+        return None
+
+    agreeing = [INDICATOR_LABEL[name] for name, signals in div_by_indicator.items()
+                if signals.get(best["sig_type"]) is not None]
+    direction = "Bullish" if best["sig_type"].endswith("bullish") else "Bearish"
+
+    return {
+        "direction": direction, "is_regular": best["is_regular"], "class": best["class"],
+        "primary_indicator": INDICATOR_LABEL[best["indicator"]], "agreeing_indicators": agreeing,
+        "detail": best["detail"], "sig_type": best["sig_type"],
+    }
+
+
+# ============================================================================
+# RVOL / Chg% / Strong-Start (original strategy)
+# ============================================================================
 
 def compute_rvol_chg_ss(daily: pd.DataFrame, lookback: int = 20, intraday: pd.DataFrame = None) -> Optional[dict]:
     """`daily`: OHLCV sorted ascending; the last row is treated as "today" --
@@ -226,15 +340,29 @@ class ScanRow:
     chg_pct: Optional[float]
     strong_start: bool
     rsi_15m: Optional[float]
-    div_15m: Optional[str]   # "Bullish" | "Bearish" | None
-    div_15m_detail: Optional[dict]
     rsi_1d: Optional[float]
-    div_1d: Optional[str]
-    div_1d_detail: Optional[dict]
+    div_15m: dict   # {"rsi": {...4 signal types...}, "obv": {...}, "mfi": {...}}
+    div_1d: dict
     note: Optional[str] = None
 
 
-def scan(tickers: list, rvol_lookback: int, div_lookback: int, pivot_order: int) -> list:
+def _patch_trailing_nan_close(df: pd.DataFrame, fallback_close: float) -> pd.DataFrame:
+    """Returns a copy of `df` with the last row's Close (and High, if it
+    would otherwise sit below the patched Close) replaced by
+    `fallback_close`. Used so RSI/OBV/MFI don't choke on -- or silently
+    mask via ewm's carry-forward behavior -- a NaN trailing Close."""
+    patched = df.copy()
+    close_col = patched.columns.get_loc("Close")
+    patched.iloc[-1, close_col] = fallback_close
+    high_col = patched.columns.get_loc("High")
+    current_high = patched.iloc[-1, high_col]
+    if pd.isna(current_high) or current_high < fallback_close:
+        patched.iloc[-1, high_col] = fallback_close
+    return patched
+
+
+def scan(tickers: list, rvol_lookback: int, div_lookback: int, pivot_order: int,
+         flat_thresh: float = 0.15, weak_thresh: float = 0.15) -> list:
     daily_data = fetch_batch(tuple(tickers), period="1y", interval="1d")
     intraday_data = fetch_batch(tuple(tickers), period="60d", interval="15m")
 
@@ -244,44 +372,58 @@ def scan(tickers: list, rvol_lookback: int, div_lookback: int, pivot_order: int)
         intraday = intraday_data.get(t)
 
         if daily is None or len(daily) < rvol_lookback + 2:
-            rows.append(ScanRow(t, None, None, None, False, None, None, None, None, None, None,
+            rows.append(ScanRow(t, None, None, None, False, None, None, _empty_div(), _empty_div(),
                                  note="No/insufficient daily data from Yahoo Finance for this ticker."))
             continue
 
         base = compute_rvol_chg_ss(daily, lookback=rvol_lookback, intraday=intraday)
         if base is None:
-            rows.append(ScanRow(t, None, None, None, False, None, None, None, None, None, None,
+            rows.append(ScanRow(t, None, None, None, False, None, None, _empty_div(), _empty_div(),
                                  note="Could not compute RVOL (insufficient history)."))
             continue
 
         row_note = None
+        daily_for_indicators = daily
         if base.get("cmp_from_fallback"):
-            row_note = "Today's daily Close was missing from Yahoo's feed -- CMP/Chg% use the latest 15m close instead."
+            row_note = "Today's daily Close was missing from Yahoo's feed -- CMP/Chg%/indicators use the latest 15m close instead."
+            daily_for_indicators = _patch_trailing_nan_close(daily, base["cmp"])
 
-        # pandas' ewm().mean() carries the PREVIOUS value forward when the
-        # trailing input is NaN rather than emitting NaN -- so if today's
-        # Close is missing, a naive rsi.iloc[-1] silently returns yesterday's
-        # RSI looking like a fresh number. Guard explicitly instead of trusting it.
-        daily_close_valid = not pd.isna(daily["Close"].iloc[-1])
-        rsi_1d_series = compute_rsi(daily["Close"])
-        rsi_1d = float(rsi_1d_series.iloc[-1]) if (daily_close_valid and not pd.isna(rsi_1d_series.iloc[-1])) else None
-        div_result_1d = detect_divergence(daily["Close"], rsi_1d_series, lookback=div_lookback, order=pivot_order)
-        div_1d = "Bullish" if div_result_1d["bullish"] else ("Bearish" if div_result_1d["bearish"] else None)
-        div_1d_detail = div_result_1d["bullish_detail"] if div_result_1d["bullish"] else div_result_1d["bearish_detail"]
+        rsi_1d_series = compute_rsi(daily_for_indicators["Close"])
+        obv_1d_series = compute_obv(daily_for_indicators["Close"], daily_for_indicators["Volume"])
+        mfi_1d_series = compute_mfi(daily_for_indicators["High"], daily_for_indicators["Low"],
+                                     daily_for_indicators["Close"], daily_for_indicators["Volume"])
+        rsi_1d = float(rsi_1d_series.iloc[-1]) if not pd.isna(rsi_1d_series.iloc[-1]) else None
 
-        rsi_15m, div_15m, div_15m_detail = None, None, None
+        div_1d = {
+            "rsi": analyze_pivots(daily_for_indicators["Close"], rsi_1d_series, div_lookback, pivot_order, flat_thresh, weak_thresh),
+            "obv": analyze_pivots(daily_for_indicators["Close"], obv_1d_series, div_lookback, pivot_order, flat_thresh, weak_thresh),
+            "mfi": analyze_pivots(daily_for_indicators["Close"], mfi_1d_series, div_lookback, pivot_order, flat_thresh, weak_thresh),
+        }
+
+        rsi_15m, div_15m = None, _empty_div()
         if intraday is not None and len(intraday) >= pivot_order * 2 + 2:
-            intraday_close_valid = not pd.isna(intraday["Close"].iloc[-1])
-            rsi_15m_series = compute_rsi(intraday["Close"])
-            rsi_15m = float(rsi_15m_series.iloc[-1]) if (intraday_close_valid and not pd.isna(rsi_15m_series.iloc[-1])) else None
-            div_result_15m = detect_divergence(intraday["Close"], rsi_15m_series, lookback=div_lookback, order=pivot_order)
-            div_15m = "Bullish" if div_result_15m["bullish"] else ("Bearish" if div_result_15m["bearish"] else None)
-            div_15m_detail = div_result_15m["bullish_detail"] if div_result_15m["bullish"] else div_result_15m["bearish_detail"]
+            intraday_for_indicators = intraday
+            if pd.isna(intraday["Close"].iloc[-1]):
+                valid = intraday["Close"].dropna()
+                if len(valid) > 0:
+                    intraday_for_indicators = _patch_trailing_nan_close(intraday, valid.iloc[-1])
+
+            rsi_15m_series = compute_rsi(intraday_for_indicators["Close"])
+            obv_15m_series = compute_obv(intraday_for_indicators["Close"], intraday_for_indicators["Volume"])
+            mfi_15m_series = compute_mfi(intraday_for_indicators["High"], intraday_for_indicators["Low"],
+                                          intraday_for_indicators["Close"], intraday_for_indicators["Volume"])
+            rsi_15m = float(rsi_15m_series.iloc[-1]) if not pd.isna(rsi_15m_series.iloc[-1]) else None
+
+            div_15m = {
+                "rsi": analyze_pivots(intraday_for_indicators["Close"], rsi_15m_series, div_lookback, pivot_order, flat_thresh, weak_thresh),
+                "obv": analyze_pivots(intraday_for_indicators["Close"], obv_15m_series, div_lookback, pivot_order, flat_thresh, weak_thresh),
+                "mfi": analyze_pivots(intraday_for_indicators["Close"], mfi_15m_series, div_lookback, pivot_order, flat_thresh, weak_thresh),
+            }
 
         rows.append(ScanRow(
             symbol=t, cmp=base["cmp"], rvol=base["rvol"], chg_pct=base["chg_pct"],
-            strong_start=base["strong_start"], rsi_15m=rsi_15m, div_15m=div_15m, div_15m_detail=div_15m_detail,
-            rsi_1d=rsi_1d, div_1d=div_1d, div_1d_detail=div_1d_detail, note=row_note,
+            strong_start=base["strong_start"], rsi_15m=rsi_15m, rsi_1d=rsi_1d,
+            div_15m=div_15m, div_1d=div_1d, note=row_note,
         ))
     return rows
 
@@ -312,7 +454,7 @@ def apply_rvol_trend(rows: list) -> dict:
 
 
 # ============================================================================
-# display
+# display -- main table
 # ============================================================================
 
 def rows_to_dataframe(rows: list, trend: dict, rvol_as: str) -> pd.DataFrame:
@@ -324,8 +466,14 @@ def rows_to_dataframe(rows: list, trend: dict, rvol_as: str) -> pd.DataFrame:
         arrow = {"up": " \u2191", "down": " \u2193"}.get(trend.get(r.symbol), "")
         return label + arrow
 
-    def fmt_div(d):
-        return {"Bullish": "\u25b2 Bullish", "Bearish": "\u25bc Bearish"}.get(d, "")
+    def fmt_div(div_dict):
+        summary = summarize_divergence(div_dict)
+        if summary is None:
+            return ""
+        arrow = "\u25b2" if summary["direction"] == "Bullish" else "\u25bc"
+        kind = "" if summary["is_regular"] else "H"
+        indicators = "+".join(summary["agreeing_indicators"])
+        return f"{arrow}{kind}{summary['class']} {indicators}"
 
     data = {
         "Symbol": [r.symbol.replace(".NS", "") for r in rows],
@@ -348,9 +496,9 @@ def style_table(df: pd.DataFrame):
         return "color: green" if val.startswith("+") else "color: red"
 
     def color_div(val):
-        if "Bullish" in val:
+        if val.startswith("\u25b2"):
             return "color: green; font-weight: bold"
-        if "Bearish" in val:
+        if val.startswith("\u25bc"):
             return "color: red; font-weight: bold"
         return ""
 
@@ -359,10 +507,14 @@ def style_table(df: pd.DataFrame):
     return styler
 
 
-def get_price_rsi_series(ticker: str, timeframe: str, all_tickers: tuple):
-    """Re-derives the raw Close/RSI series for one ticker so the detail view
-    can chart them. Deliberately calls fetch_batch with the SAME tickers
-    tuple used by the main scan (not just [ticker]) so this hits the
+# ============================================================================
+# display -- divergence detail (click-through)
+# ============================================================================
+
+def get_price_indicator_series(ticker: str, timeframe: str, indicator_name: str, all_tickers: tuple):
+    """Re-derives the raw Close + indicator series for one ticker so the
+    detail view can chart them. Deliberately calls fetch_batch with the SAME
+    tickers tuple used by the main scan (not just [ticker]) so this hits the
     existing st.cache_data entry instead of triggering a fresh yfinance call."""
     if timeframe == "1d":
         data = fetch_batch(all_tickers, period="1y", interval="1d")
@@ -372,78 +524,108 @@ def get_price_rsi_series(ticker: str, timeframe: str, all_tickers: tuple):
     if df is None:
         return None, None
     close = df["Close"]
-    rsi = compute_rsi(close)
-    return close, rsi
+    if indicator_name == "rsi":
+        ind = compute_rsi(close)
+    elif indicator_name == "obv":
+        ind = compute_obv(close, df["Volume"])
+    elif indicator_name == "mfi":
+        ind = compute_mfi(df["High"], df["Low"], close, df["Volume"])
+    else:
+        return None, None
+    return close, ind
 
 
-def build_divergence_chart(close: pd.Series, rsi: pd.Series, detail: dict, kind: str, context_bars: int = 60):
-    """Two-panel price+RSI chart with the divergence's two pivot points
-    marked and connected on both panes -- the visual crosscheck. Shows some
-    context before/after the pivots, not just the two points in isolation."""
+def build_divergence_chart(close: pd.Series, indicator_series: pd.Series, detail: dict,
+                            direction: str, indicator_name: str, context_bars: int = 60):
+    """Two-panel price+indicator chart with the divergence's two pivot
+    points marked and connected on both panes -- the visual crosscheck."""
     end_time = detail["curr"]["time"]
     end_pos = close.index.get_indexer([end_time], method="nearest")[0]
     start_pos = max(0, end_pos - context_bars)
     stop_pos = min(len(close), end_pos + max(5, context_bars // 6))
 
     price_window = close.iloc[start_pos:stop_pos]
-    rsi_window = rsi.iloc[start_pos:stop_pos]
+    ind_window = indicator_series.iloc[start_pos:stop_pos]
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4],
-                         vertical_spacing=0.06, subplot_titles=("Price", "RSI"))
+                         vertical_spacing=0.06, subplot_titles=("Price", indicator_name))
 
     fig.add_trace(go.Scatter(x=price_window.index, y=price_window.values, mode="lines",
                               name="Price", line=dict(color="#1f77b4", width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=rsi_window.index, y=rsi_window.values, mode="lines",
-                              name="RSI", line=dict(color="#9467bd", width=1.5)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=ind_window.index, y=ind_window.values, mode="lines",
+                              name=indicator_name, line=dict(color="#9467bd", width=1.5)), row=2, col=1)
 
-    color = "#0b8043" if kind == "Bullish" else "#cc2222"
+    color = "#0b8043" if direction == "Bullish" else "#cc2222"
     prev, curr = detail["prev"], detail["curr"]
     fig.add_trace(go.Scatter(x=[prev["time"], curr["time"]], y=[prev["price"], curr["price"]],
                               mode="markers+lines", marker=dict(size=11, color=color, symbol="diamond"),
-                              line=dict(color=color, dash="dash", width=2), name=f"{kind} (price)"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=[prev["time"], curr["time"]], y=[prev["rsi"], curr["rsi"]],
+                              line=dict(color=color, dash="dash", width=2), name=f"{direction} (price)"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=[prev["time"], curr["time"]], y=[prev["indicator"], curr["indicator"]],
                               mode="markers+lines", marker=dict(size=11, color=color, symbol="diamond"),
-                              line=dict(color=color, dash="dash", width=2), name=f"{kind} (RSI)"), row=2, col=1)
+                              line=dict(color=color, dash="dash", width=2), name=f"{direction} ({indicator_name})"), row=2, col=1)
 
-    fig.add_hline(y=70, line_dash="dot", line_color="gray", row=2, col=1)
-    fig.add_hline(y=30, line_dash="dot", line_color="gray", row=2, col=1)
+    if indicator_name in ("RSI", "MFI"):
+        fig.add_hline(y=70, line_dash="dot", line_color="gray", row=2, col=1)
+        fig.add_hline(y=30, line_dash="dot", line_color="gray", row=2, col=1)
 
     fig.update_layout(height=480, showlegend=False, margin=dict(t=40, b=10, l=10, r=10))
     return fig
 
 
-def render_divergence_detail(row: "ScanRow", all_tickers: tuple):
-    """The click-through detail panel: exact From/To bars (time, price, RSI)
-    plus a chart, for each timeframe that has a flagged divergence."""
+def all_signals_for_row(row: ScanRow) -> list:
+    """Flattens row.div_15m / row.div_1d into a list of
+    (label, timeframe, indicator, sig_type, info) for every signal found,
+    sorted strongest-class first."""
+    out = []
+    for tf_label, div_dict in [("15m", row.div_15m), ("1D", row.div_1d)]:
+        for ind_name, signals in div_dict.items():
+            for sig_type in SIGNAL_TYPES:
+                info = signals.get(sig_type)
+                if info is None:
+                    continue
+                direction = "Bullish" if sig_type.endswith("bullish") else "Bearish"
+                kind = "Regular" if sig_type.startswith("regular") else "Hidden"
+                label = f"{tf_label} | {INDICATOR_LABEL[ind_name]} | {kind} {direction} | Class {info['class']}"
+                out.append((label, tf_label, ind_name, sig_type, info))
+    out.sort(key=lambda x: CLASS_RANK[x[4]["class"]], reverse=True)
+    return out
+
+
+def render_divergence_detail(row: ScanRow, all_tickers: tuple):
     st.subheader(f"Divergence detail \u2014 {row.symbol.replace('.NS', '')}")
 
-    panels = [("15m", row.div_15m, row.div_15m_detail), ("1D", row.div_1d, row.div_1d_detail)]
-    panels = [(tf, kind, detail) for tf, kind, detail in panels if kind and detail]
-
-    if not panels:
-        st.info("No divergence flagged for this symbol on either timeframe.")
+    signals = all_signals_for_row(row)
+    if not signals:
+        st.info("No divergence flagged for this symbol on either timeframe/indicator.")
         return
 
-    for tf, kind, detail in panels:
-        arrow = "\u25b2" if kind == "Bullish" else "\u25bc"
-        st.markdown(f"**{tf} \u2014 {arrow} {kind} divergence**")
-        prev, curr = detail["prev"], detail["curr"]
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("*From (earlier swing)*")
-            st.write(f"Time: {prev['time']}")
-            st.write(f"Price: {prev['price']:.2f}")
-            st.write(f"RSI: {prev['rsi']:.1f}")
-        with c2:
-            st.markdown("*To (latest swing)*")
-            st.write(f"Time: {curr['time']}")
-            st.write(f"Price: {curr['price']:.2f}")
-            st.write(f"RSI: {curr['rsi']:.1f}")
+    labels = [s[0] for s in signals]
+    choice = st.selectbox("Signal to inspect", options=labels, key=f"div_choice_{row.symbol}")
+    _, tf_label, ind_name, sig_type, info = next(s for s in signals if s[0] == choice)
 
-        close, rsi = get_price_rsi_series(row.symbol, "1d" if tf == "1D" else "15m", all_tickers)
-        if close is not None:
-            st.plotly_chart(build_divergence_chart(close, rsi, detail, kind), use_container_width=True)
-        st.divider()
+    direction = "Bullish" if sig_type.endswith("bullish") else "Bearish"
+    kind = "Regular" if sig_type.startswith("regular") else "Hidden"
+    arrow = "\u25b2" if direction == "Bullish" else "\u25bc"
+    indicator_label = INDICATOR_LABEL[ind_name]
+    st.markdown(f"**{arrow} {kind} {direction} divergence \u2014 {indicator_label}, Class {info['class']}**")
+
+    prev, curr = info["prev"], info["curr"]
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("*From (earlier swing)*")
+        st.write(f"Time: {prev['time']}")
+        st.write(f"Price: {prev['price']:.2f}")
+        st.write(f"{indicator_label}: {prev['indicator']:.2f}")
+    with c2:
+        st.markdown("*To (latest swing)*")
+        st.write(f"Time: {curr['time']}")
+        st.write(f"Price: {curr['price']:.2f}")
+        st.write(f"{indicator_label}: {curr['indicator']:.2f}")
+
+    close, ind_series = get_price_indicator_series(row.symbol, "1d" if tf_label == "1D" else "15m", ind_name, all_tickers)
+    if close is not None:
+        fig = build_divergence_chart(close, ind_series, info, direction, indicator_label)
+        st.plotly_chart(fig, use_container_width=True)
 
 
 # ============================================================================
@@ -451,9 +633,9 @@ def render_divergence_detail(row: "ScanRow", all_tickers: tuple):
 # ============================================================================
 
 def main():
-    st.set_page_config(page_title="RVOL + RSI Divergence Scanner", layout="wide")
-    st.title("RVOL + RSI Divergence Scanner")
-    st.caption("RVOL/Chg%/Strong-Start (original strategy) + RSI divergence on 15m & 1D. Data: Yahoo Finance (delayed).")
+    st.set_page_config(page_title="RVOL + Divergence Scanner", layout="wide")
+    st.title("RVOL + Divergence Scanner")
+    st.caption("RVOL/Chg%/Strong-Start (original strategy) + RSI/OBV/MFI divergence (regular & hidden, Class A/B/C) on 15m & 1D. Data: Yahoo Finance (delayed).")
 
     with st.sidebar:
         st.header("Watchlist")
@@ -465,11 +647,17 @@ def main():
 
         st.header("Settings")
         rvol_lookback = st.number_input("RVOL average-volume lookback (days)", min_value=5, max_value=100, value=20)
-        div_lookback = st.selectbox("RSI divergence lookback (candles)", options=[50, 100], index=0)
+        div_lookback = st.selectbox("Divergence lookback (candles)", options=[50, 100], index=0)
         pivot_order = st.slider("Swing-pivot sensitivity (bars each side)", min_value=2, max_value=6, value=3,
                                  help="Lower = more sensitive (more, smaller swings flagged). Higher = only larger swings count.")
         sort_by = st.selectbox("Sort by", options=["RVOL", "Chg%", "SS"], index=0)
         rvol_as = st.radio("RVOL as", options=["percent", "ratio"], horizontal=True)
+
+        with st.expander("Advanced: divergence class thresholds"):
+            flat_thresh = st.slider("Class B threshold (price 'flat' if move < this % of its range)",
+                                     0.05, 0.30, 0.15, 0.01)
+            weak_thresh = st.slider("Class C threshold (indicator 'weak' if move < this % of its range)",
+                                     0.05, 0.30, 0.15, 0.01)
 
         st.header("Refresh")
         auto_refresh = st.checkbox("Auto-refresh", value=False)
@@ -489,7 +677,8 @@ def main():
         return
 
     with st.spinner(f"Fetching {len(tickers)} symbols from Yahoo Finance..."):
-        rows = scan(tickers, rvol_lookback=rvol_lookback, div_lookback=div_lookback, pivot_order=pivot_order)
+        rows = scan(tickers, rvol_lookback=rvol_lookback, div_lookback=div_lookback,
+                    pivot_order=pivot_order, flat_thresh=flat_thresh, weak_thresh=weak_thresh)
     st.session_state.last_rows = rows
 
     trend = apply_rvol_trend(rows)
@@ -509,6 +698,12 @@ def main():
     event = st.dataframe(
         style_table(df), use_container_width=True, hide_index=True,
         on_select="rerun", selection_mode="single-row",
+    )
+
+    st.caption(
+        "Div column legend: \u25b2/\u25bc = bullish/bearish, "
+        "H = hidden (blank = regular), letter = Class A/B/C (A strongest), "
+        "trailing names = which indicators agree (confluence)."
     )
 
     selected_positions = event.selection.rows if event and event.selection else []
