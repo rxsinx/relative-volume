@@ -325,8 +325,8 @@ def fetch_batch(tickers: tuple, period: str, interval: str) -> dict:
     result = {}
     for t in tickers:
         try:
-            df = raw[t].dropna(how="all").sort_index()  # guarantee chronological order -- .iloc[-1]/.index[-1]
-            result[t] = df if len(df) > 0 else None      # are relied on everywhere downstream to mean "most recent"
+            df = raw[t].dropna(how="all")
+            result[t] = df if len(df) > 0 else None
         except (KeyError, TypeError):
             result[t] = None
     return result
@@ -343,7 +343,6 @@ class ScanRow:
     rsi_1d: Optional[float]
     div_15m: dict   # {"rsi": {...4 signal types...}, "obv": {...}, "mfi": {...}}
     div_1d: dict
-    last_bar_date: Optional[object] = None  # date of the daily bar actually used -- for staleness transparency
     note: Optional[str] = None
 
 
@@ -367,16 +366,6 @@ def scan(tickers: list, rvol_lookback: int, div_lookback: int, pivot_order: int,
     daily_data = fetch_batch(tuple(tickers), period="1y", interval="1d")
     intraday_data = fetch_batch(tuple(tickers), period="60d", interval="15m")
 
-    # Reference "latest available session" = the most recent daily-bar date
-    # seen across the WHOLE batch. Yahoo's historical/chart API (what
-    # yf.download() hits) and Yahoo's own live quote page are different
-    # backend pipelines that don't always update in lockstep -- this lags
-    # more often on thinner-traded names. Comparing each symbol against the
-    # rest of the batch (rather than against wall-clock "today", which is
-    # unreliable around weekends/holidays) surfaces that lag directly.
-    valid_last_dates = [df.index[-1] for df in daily_data.values() if df is not None and len(df) > 0]
-    reference_date = max(valid_last_dates) if valid_last_dates else None
-
     rows = []
     for t in tickers:
         daily = daily_data.get(t)
@@ -393,25 +382,11 @@ def scan(tickers: list, rvol_lookback: int, div_lookback: int, pivot_order: int,
                                  note="Could not compute RVOL (insufficient history)."))
             continue
 
-        last_bar_date = daily.index[-1]
-        note_parts = []
-
-        if reference_date is not None:
-            staleness_days = (reference_date - last_bar_date).days
-            if staleness_days >= 2:
-                note_parts.append(
-                    f"Data may be stale: latest daily bar is from {last_bar_date.date()} "
-                    f"({staleness_days} days behind the freshest symbol in this scan). This is a known "
-                    f"Yahoo Finance lag on their historical/chart feed for some symbols (their live quote "
-                    f"page can be more current) -- not necessarily an app-side issue. RVOL/Chg%/SS/indicators "
-                    f"below are computed from this stale bar, so treat them cautiously for this symbol."
-                )
-
+        row_note = None
         daily_for_indicators = daily
         if base.get("cmp_from_fallback"):
-            note_parts.append("Today's daily Close was missing from Yahoo's feed -- CMP/Chg%/indicators use the latest 15m close instead.")
+            row_note = "Today's daily Close was missing from Yahoo's feed -- CMP/Chg%/indicators use the latest 15m close instead."
             daily_for_indicators = _patch_trailing_nan_close(daily, base["cmp"])
-        row_note = " | ".join(note_parts) if note_parts else None
 
         rsi_1d_series = compute_rsi(daily_for_indicators["Close"])
         obv_1d_series = compute_obv(daily_for_indicators["Close"], daily_for_indicators["Volume"])
@@ -448,7 +423,7 @@ def scan(tickers: list, rvol_lookback: int, div_lookback: int, pivot_order: int,
         rows.append(ScanRow(
             symbol=t, cmp=base["cmp"], rvol=base["rvol"], chg_pct=base["chg_pct"],
             strong_start=base["strong_start"], rsi_15m=rsi_15m, rsi_1d=rsi_1d,
-            div_15m=div_15m, div_1d=div_1d, last_bar_date=last_bar_date, note=row_note,
+            div_15m=div_15m, div_1d=div_1d, note=row_note,
         ))
     return rows
 
@@ -619,11 +594,6 @@ def all_signals_for_row(row: ScanRow) -> list:
 def render_divergence_detail(row: ScanRow, all_tickers: tuple):
     st.subheader(f"Divergence detail \u2014 {row.symbol.replace('.NS', '')}")
 
-    if row.last_bar_date is not None:
-        st.caption(f"Latest daily bar used: {row.last_bar_date.date()}")
-    if row.note:
-        st.warning(row.note)
-
     signals = all_signals_for_row(row)
     if not signals:
         st.info("No divergence flagged for this symbol on either timeframe/indicator.")
@@ -692,14 +662,7 @@ def main():
         st.header("Refresh")
         auto_refresh = st.checkbox("Auto-refresh", value=False)
         interval_s = st.number_input("Interval (seconds)", min_value=30, max_value=1800, value=300, step=30)
-        force_refresh = st.checkbox(
-            "Force refresh (bypass 5-min cache)", value=False,
-            help="Clears the cached Yahoo Finance data before this scan. Use this if you suspect a symbol's data is stale rather than waiting out the normal 5-minute cache."
-        )
         run_clicked = st.button("Run scan", type="primary")
-
-    if force_refresh:
-        fetch_batch.clear()
 
     if auto_refresh:
         st_autorefresh(interval=interval_s * 1000, key="autorefresh")
